@@ -351,6 +351,14 @@ struct park_task {
     int  slot_known;
     unsigned int parking_space;
     char parkinglot[64];
+
+    /* Set when res_parking reports the park has ended — retrieved
+     * by another extension, timed out, or the parkee hung up. The
+     * worker thread waits on cond until one of these fires so it
+     * can send the terminating NOTIFY with <event>retrieved</event>
+     * at the right moment (mirrors CUCM's CSeq-102 NOTIFY). */
+    int  ended;
+    enum ast_parked_call_event_type end_reason;
 };
 
 static void park_stasis_cb(void *data, struct stasis_subscription *sub,
@@ -366,21 +374,56 @@ static void park_stasis_cb(void *data, struct stasis_subscription *sub,
         return;
     }
     p = stasis_message_data(msg);
-    if (!p || p->event_type != PARKED_CALL || !p->parkee || !p->parkee->base) {
-        return;
-    }
-    if (strcmp(p->parkee->base->name, task->peer_name) != 0) {
+    if (!p) {
         return;
     }
 
-    ast_mutex_lock(&task->mtx);
-    task->parking_space = p->parkingspace;
-    ast_copy_string(task->parkinglot,
-        p->parkinglot ? p->parkinglot : "default",
-        sizeof(task->parkinglot));
-    task->slot_known = 1;
-    ast_cond_broadcast(&task->cond);
-    ast_mutex_unlock(&task->mtx);
+    /* Phase 1: initial park.  Match by parkee channel name — this is
+     * the only identifier we have before the parking lot has assigned
+     * a slot. */
+    if (p->event_type == PARKED_CALL) {
+        if (!p->parkee || !p->parkee->base ||
+            strcmp(p->parkee->base->name, task->peer_name) != 0) {
+            return;
+        }
+
+        ast_mutex_lock(&task->mtx);
+        task->parking_space = p->parkingspace;
+        ast_copy_string(task->parkinglot,
+            p->parkinglot ? p->parkinglot : "default",
+            sizeof(task->parkinglot));
+        task->slot_known = 1;
+        ast_cond_broadcast(&task->cond);
+        ast_mutex_unlock(&task->mtx);
+        return;
+    }
+
+    /* Phase 2: park ends.  Any of UNPARKED / TIMEOUT / GIVEUP /
+     * FAILED ends the "Parked at NN" indicator on the phone.  Match
+     * by parkingspace+parkinglot rather than channel name — the
+     * parkee's name may have changed due to masquerade between
+     * the initial PARKED_CALL event and this one. */
+    if (p->event_type == PARKED_CALL_UNPARKED ||
+        p->event_type == PARKED_CALL_TIMEOUT  ||
+        p->event_type == PARKED_CALL_GIVEUP   ||
+        p->event_type == PARKED_CALL_FAILED) {
+
+        ast_mutex_lock(&task->mtx);
+        if (!task->slot_known || task->ended) {
+            ast_mutex_unlock(&task->mtx);
+            return;
+        }
+        if (p->parkingspace != task->parking_space ||
+            strcmp(p->parkinglot ? p->parkinglot : "default",
+                   task->parkinglot) != 0) {
+            ast_mutex_unlock(&task->mtx);
+            return;
+        }
+        task->ended = 1;
+        task->end_reason = p->event_type;
+        ast_cond_broadcast(&task->cond);
+        ast_mutex_unlock(&task->mtx);
+    }
 }
 
 /* ---------- park worker thread ---------------------------------------- */
@@ -537,16 +580,63 @@ static void *cc_park_thread(void *data)
         }
     }
 
-    /* Give the phone a moment to process the active NOTIFY before we
-     * close the refer subscription. */
-    usleep(500000);
+    /* ---- Phase 2: wait for the park to end ------------------------
+     *
+     * The REFER subscription dialog (separate Call-ID from the parked
+     * INVITE) outlives the phone's call leg that we just hung up.
+     * We block here until res_parking reports the park has ended —
+     * retrieved by another extension, timed out, or the parkee hung
+     * up in the lot — then send the terminating NOTIFY so the phone
+     * clears "Parked at NN" from its screen.
+     *
+     * Cap the wait at the 3600 s Subscription-State expires we
+     * advertised in the active NOTIFY, so a never-retrieved park
+     * eventually closes the subscription cleanly. */
+    ast_log(LOG_NOTICE,
+        "CiscoPark: waiting for parkee retrieval (slot %u in '%s')\n",
+        t->parking_space, t->parkinglot);
 
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 3600;
+    wait_rc = 0;
+
+    ast_mutex_lock(&t->mtx);
+    while (!t->ended && wait_rc == 0) {
+        wait_rc = ast_cond_timedwait(&t->cond, &t->mtx, &ts);
+    }
+    ast_mutex_unlock(&t->mtx);
+
+    if (!t->ended) {
+        ast_log(LOG_NOTICE,
+            "CiscoPark: subscription timeout reached before "
+            "retrieval; sending terminated NOTIFY (slot %u)\n",
+            t->parking_space);
+    } else {
+        const char *reason_str;
+        switch (t->end_reason) {
+        case PARKED_CALL_UNPARKED: reason_str = "unparked"; break;
+        case PARKED_CALL_TIMEOUT:  reason_str = "timeout";  break;
+        case PARKED_CALL_GIVEUP:   reason_str = "giveup";   break;
+        case PARKED_CALL_FAILED:   reason_str = "failed";   break;
+        default:                   reason_str = "unknown";  break;
+        }
+        ast_log(LOG_NOTICE,
+            "CiscoPark: parkee retrieved (slot %u, reason=%s)\n",
+            t->parking_space, reason_str);
+    }
+
+    /* Build terminating body with <event>retrieved</event> — matches
+     * CUCM's CSeq-102 NOTIFY in the reference capture, which is what
+     * the Cisco phone looks for to clear the park indicator. */
     snprintf(body_xml, sizeof(body_xml),
         "<dialog-info xmlns=\"urn:ietf:params:xml:ns:dialog-info\"\n"
         " xmlns:call=\"urn:x-cisco:params:xml:ns:dialog-info:dialog:callinfo-dialog\"\n"
         " version=\"2\" state=\"full\" entity=\"sip:%u@%s\">\n"
         " <dialog id=\"park\">\n"
         "  <state>terminated</state>\n"
+        "  <call:park>\n"
+        "   <event>retrieved</event>\n"
+        "  </call:park>\n"
         " </dialog>\n"
         "</dialog-info>\n",
         t->parking_space, t->ctx.local_host);

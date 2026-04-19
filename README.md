@@ -193,7 +193,9 @@ asterisk -rx "dialplan reload"
    - The *peer* is redirected to `[cisco-park]` and executes `Park()`.
    - The *phone* is redirected to `[cisco-park-phone]` and sits in a short `Wait(1)`. This keeps the channel alive just long enough to receive the `NOTIFY` response before hanging up, bypassing FreePBX's missed-call post-bridge routines.
 4. **Stasis Event Monitor:** The worker thread listens on `ast_parking_topic()` for the `PARKED_CALL` event matching the newly parked peer, learning its parking space index (e.g. 71).
-5. **NOTIFY to Phone:** A sip `NOTIFY` containing `application/dialog-info+xml` is blasted back to the phone with `<event>parked</event>` and `entity="sip:71@host"`, natively triggering the phone interface to display "Parked at 71". A termination notify follows to unlock the phone's softkey state.
+5. **NOTIFY to Phone:** A sip `NOTIFY` containing `application/dialog-info+xml` is blasted back to the phone with `<event>parked</event>` and `entity="sip:71@host"`, natively triggering the phone interface to display "Parked at 71".
+6. **Wait for retrieval:** The worker thread stays subscribed to `ast_parking_topic()` and blocks until `res_parking` reports that the park has ended — either because another extension retrieved the call (`PARKED_CALL_UNPARKED`), the parking timeout expired (`PARKED_CALL_TIMEOUT`), or the parkee hung up in the lot (`PARKED_CALL_GIVEUP` / `PARKED_CALL_FAILED`). Subsequent events are matched by parking space + parking lot, which survive any channel-name masquerade between park and unpark. The wait is capped at 3600 s — the `expires` value we advertised in the active NOTIFY — so an orphaned subscription eventually closes on its own.
+7. **Terminating NOTIFY:** Once the park ends, a second `NOTIFY` on the same REFER subscription dialog is sent with `Subscription-State: terminated;reason=noresource` and a body carrying `<state>terminated</state>` plus `<call:park><event>retrieved</event></call:park>`. This matches CUCM's on-wire behavior and is what the Cisco phone looks for to clear "Parked at 71" from its screen.
 
 ---
 
@@ -213,7 +215,20 @@ NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: ParkMonitor REFER — call-id='..
 NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: parking peer '...' (phone=...)
 NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: peer parked at slot 71 in 'default'
 NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: sent NOTIFY active;expires=3600
+NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: waiting for parkee retrieval (slot 71 in 'default')
+```
+
+The worker thread now stays alive until the parked call is retrieved, times out, or the caller hangs up. When that happens you'll see:
+
+```text
+NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: parkee retrieved (slot 71, reason=unparked)
 NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: sent NOTIFY terminated;reason=noresource
+```
+
+`reason=` will be one of `unparked` (retrieved by another extension), `timeout` (parking timeout expired), `giveup` (parkee hung up while parked), or `failed`. If nothing ends the park within the 3600 s subscription lifetime, the worker falls back with:
+
+```text
+NOTICE[...] res_pjsip_cisco_park.c: CiscoPark: subscription timeout reached before retrieval; sending terminated NOTIFY (slot 71)
 ```
 
 ### Missing [cisco-park-phone] Context Warning
